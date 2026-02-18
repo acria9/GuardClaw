@@ -1,0 +1,46 @@
+# GuardClaw — .gitignore
+
+# ── Local state files (never commit these) ────────────────────────
+guardclaw_history.jsonl     # personal scan history — stays on your machine
+.guardclaw_welcomed_v4      # onboarding flag — regenerated on first run
+.guardclaw_welcomed_*       # future onboarding flags
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Virtual environments ──────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── OS ────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ── Editors ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Security / secrets ───────────────────────────────────────────
+*.env
+.env.*
+*.key
+*.pem
+*.p12
+secrets.json
