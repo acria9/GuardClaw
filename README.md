@@ -14,11 +14,66 @@ Autonomous agents like **OpenClaw** have access to your files, terminal, browser
 
 GuardClaw sits between your agent and that threat.
 
+---
+
+## Architecture & Threat Model
+
+### Deployment model
+
+GuardClaw is designed to run **outside** the agent workspace as a standalone process or library. The `SKILL.md` file only tells the agent *how to invoke it* — it does not give the agent new capabilities or access to sensitive data.
+
 ```
-User ──► Agent ──► [GuardClaw pre-check] ──► Tool execution
-                         │
-              Tool result ◄──── [GuardClaw post-check] ◄──── Raw result
+┌─────────────────────────────────────────┐
+│  OpenClaw workspace (~/.openclaw/)      │
+│                                         │
+│   Agent  ──►  SKILL.md (invoke only)   │
+│                    │                    │
+└────────────────────│────────────────────┘
+                     │ subprocess call
+                     ▼
+         ┌─────────────────────┐
+         │  GuardClaw process  │  ← runs OUTSIDE the workspace
+         │  (any directory)    │
+         └─────────────────────┘
 ```
+
+This means GuardClaw does not need to live in `~/.openclaw/`. The recommended install location is a directory outside the agent workspace, e.g. `~/guardclaw/` or `/opt/guardclaw/`.
+
+### What each layer does (and what it can access)
+
+This table is the honest answer to "how do I know this tool isn't the threat?"
+
+| Layer | What it does | Network access | Sees your data? |
+|---|---|---|---|
+| **Static Scanner** | Regex rules against input | ❌ None | Scans it, never stores it |
+| **PII Masker** | Replaces emails/phones/cards with placeholders | ❌ None | Transforms it, discards original |
+| **Ollama AI Scan** | Deep analysis via local model | ❌ None (local only) | Sees masked version only |
+| **Output Scrubber** | Scans AI response before display | ❌ None | Scans it, never stores it |
+| **Clipboard Monitor** | Reads clipboard for wallet addresses | ❌ None | Reads clipboard text only |
+| **History Manager** | Logs scan metadata | ❌ None | Stores SHA-256 hash only — never content |
+
+**The AI deep scan is fully optional.** The static scanner catches the majority of threats with zero network access and zero model involvement. Enable Ollama only if you want the second-pass analysis.
+
+### What GuardClaw does NOT protect against
+
+- A compromised Ollama model (if you use AI deep scan with a tampered model, all bets are off — use official Ollama releases)
+- Attacks that occur before GuardClaw is in the call path
+- Novel zero-day patterns not yet in the ruleset
+- Physical access to your machine
+- Poor operational security (using autonomous agents for high-stakes financial operations is itself a risk that no security tool fully mitigates)
+
+### On the clipboard monitor
+
+The clipboard monitor uses `pyperclip.paste()` — it reads clipboard text only, not keystrokes. It is not a keylogger. The code is auditable at `ClipboardMonitor._loop()` in `guardclaw.py`. It is off by default and must be explicitly enabled.
+
+### On trust
+
+GuardClaw is maintained by independent developers with no established security community reputation. You should:
+- Read the code before deploying it (it is ~2900 lines of plain Python)
+- Not connect it to high-stakes financial operations without understanding what it does
+- Apply the same scrutiny you would to any open-source security tool
+
+The code is MIT licensed, fully open, and contains no obfuscated sections.
 
 ---
 
@@ -85,7 +140,7 @@ pip install -r requirements.txt
 # For async agent integration (optional):
 pip install httpx
 
-# Install and start Ollama (for AI deep scan):
+# Install and start Ollama (for AI deep scan — optional):
 # https://ollama.ai
 ollama serve
 ollama pull qwen2.5-coder:1.5b   # lightweight, fast (~1 GB)
@@ -128,23 +183,21 @@ python3 guardclaw.py --scan script.sh --mode junior
 
 ## OpenClaw Integration
 
-### Option 1: Skill install (automatic)
-
-The `install.sh` script automatically detects OpenClaw and copies the GuardClaw skill to `~/.openclaw/workspace/skills/guardclaw/`. After that, just tell your agent:
-
-> *"Before executing any tool, run a GuardClaw security check on the arguments."*
-
-### Option 2: Manual skill install
+### Recommended: install GuardClaw outside the agent workspace
 
 ```bash
+# Install GuardClaw in a directory outside ~/.openclaw/
+git clone https://github.com/acria9/GuardClaw.git ~/guardclaw
+pip install -r ~/guardclaw/requirements.txt
+
+# Copy only the SKILL.md (invoke instructions) into OpenClaw
 mkdir -p ~/.openclaw/workspace/skills/guardclaw
-cp SKILL.md ~/.openclaw/workspace/skills/guardclaw/SKILL.md
-cp guardclaw.py ~/.openclaw/workspace/skills/guardclaw/guardclaw.py
+cp ~/guardclaw/SKILL.md ~/.openclaw/workspace/skills/guardclaw/SKILL.md
 ```
 
-### Option 3: Python bridge (programmatic)
+The agent reads `SKILL.md` to know how to call GuardClaw. The actual scanner runs as a separate process from `~/guardclaw/`, outside the workspace.
 
-Use `openclaw_bridge.py` for direct integration into your OpenClaw setup:
+### Option: Python bridge (programmatic)
 
 ```python
 from openclaw_bridge import GuardClawBridge
@@ -161,7 +214,7 @@ result = bridge.check_output("fetch_url", raw_tool_result)
 safe_content = result["safe_content"]
 ```
 
-### Option 4: Library API (full control)
+### Option: Library API (full control)
 
 ```python
 from guardclaw import Protector, Action
@@ -184,15 +237,15 @@ safe_result = Protector.guarded_tool_call(
     human_confirmation=lambda d: input(f"Allow? {d.reasons[0][1]} [y/N]: ") == "y",
 )
 
-# Ingress: scan content before sending to the AI model
+# Ingress: scan before sending to the AI model
 pre = Protector.pre_model(user_input, mode="bouncer", mask_pii=True)
 if pre.action == Action.BLOCK:
     return "Content blocked by GuardClaw."
 safe_input = pre.redacted_text  # PII already masked
 
-# Egress: scan AI output before showing to user or feeding back to agent
+# Egress: scan AI output before showing to user
 post = Protector.post_model(ai_response, mode="bouncer", pii_mapping=pre.pii_mapping)
-safe_response = post.redacted_text  # dangerous snippets redacted
+safe_response = post.redacted_text
 
 # Async support for asyncio-based agents
 import asyncio
@@ -200,40 +253,12 @@ from guardclaw import query_ollama_async, build_system_prompt, build_user_messag
 
 async def deep_scan(text):
     static = StaticScanner().scan(text)
-    result = await query_ollama_async(
+    return await query_ollama_async(
         build_system_prompt("bouncer", static),
         build_user_message(text),
         model="qwen2.5-coder:7b",
     )
-    return result
 ```
-
----
-
-## Threat Model
-
-### What GuardClaw protects against
-
-| Threat | Vector | Detection |
-|---|---|---|
-| Prompt injection | Web pages, emails, documents read by agent | Static patterns + AI analysis |
-| Credential harvesting | `~/.openclaw/`, `~/.ssh/`, `.env` files | Static patterns |
-| DNS exfiltration | Subdomain-encoded data in DNS lookups | Static patterns |
-| Tool chaining | fetch → exec sequences | Static patterns |
-| Messaging exfiltration | Send env vars via WhatsApp/Telegram | Static patterns |
-| Clipboard poisoning | Wallet address replacement | CryptoGuard + ClipboardMonitor |
-| RCE | Reverse shells, webshells, encoded payloads | Static patterns + AI |
-| Data exfiltration | `curl \| bash`, credential file reads | Static patterns |
-| Agentic loop hijacking | Infinite loops, cron persistence | Static patterns |
-| PII leakage | Emails, phones, credit cards sent to AI | PIIMasker |
-| Secret leakage in AI output | API keys, tokens in model responses | OutputScrubber |
-
-### What GuardClaw does NOT protect against
-
-- Vulnerabilities in Ollama itself (report those to the [Ollama project](https://github.com/ollama/ollama))
-- Novel zero-day attack patterns not yet in the ruleset
-- Attacks that occur before GuardClaw is invoked (it must be in the call path)
-- Physical access to your machine
 
 ---
 
@@ -246,7 +271,7 @@ Create a `RULES.json` file in the GuardClaw directory:
 ```json
 {
   "code_patterns": [
-    ["MY_COMPANY", "high", "internal-api\\.mycompany\\.com", "Internal API endpoint in external content"]
+    ["MY_COMPANY", "high", "internal-api\\.mycompany\\.com", "Internal API in external content"]
   ],
   "prompt_injection": [
     "ignore your previous persona"
@@ -264,9 +289,9 @@ Severity must be one of: `low`, `medium`, `high`, `critical`.
 ## Security Notes
 
 - All analysis runs **on your machine**. No content is sent to external servers.
-- The AI model runs via Ollama — fully local.
-- Scan history stores only metadata and a SHA-256 hash. Sensitive content (passwords, API keys, wallet addresses) is **never** stored in plaintext.
-- GuardClaw is a defense layer, not a guarantee. It helps you catch threats — it does not replace good security practices.
+- The AI model runs via Ollama — fully local and optional.
+- Scan history stores only metadata and a SHA-256 hash. Sensitive content is **never** stored in plaintext.
+- GuardClaw is a defense layer, not a guarantee. It reduces automated attack surface — it does not replace good security practices or human judgment.
 
 **Found a vulnerability in GuardClaw itself?** Please do **not** open a public issue. See [SECURITY.md](SECURITY.md) for responsible disclosure.
 
@@ -275,12 +300,11 @@ Severity must be one of: `low`, `medium`, `high`, `critical`.
 ## Requirements
 
 - Python 3.9+
-- [Ollama](https://ollama.ai) (for AI deep scan — optional, static scanner works without it)
+- [Ollama](https://ollama.ai) (optional — for AI deep scan only)
 
 ```bash
 pip install customtkinter pyperclip requests
-# Optional:
-pip install httpx  # async support
+pip install httpx  # optional: async support
 ```
 
 ---
